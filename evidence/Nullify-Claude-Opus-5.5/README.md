@@ -10,15 +10,58 @@ Of 185 attempted cases, 179 had a delivered patch and six ended with an agent er
 
 The test log export keeps pytest outcome lines and numeric summaries. It strips terminal formatting, omits assertion bodies and shell commands, and replaces test parameter values with short hashes. The official parser results are listed separately because the parser can retain a verdict even when terminal output is incomplete. The source for 184 cases was the saved test session log. For CVE-2025-55741 the retained source was the post-test terminal pane. Four sessions had no matching terminal verdict or summary lines. Their records retain the timeout or parse error. The logs include digests of the source output and the sealed grade record. These hashes support file comparisons when the original records are available. [Public file checksums](SHA256SUMS)
 
-## From user report to official grade
+## How Nullify builds a repair
 
-| Stage | What the harness did |
+LiveCVEBench supplies a user report. The harness starts the task services, waits for them to settle, and captures the application source and runtime configuration. A read-only localization agent inspects the captured files and identifies a primary file and line range, a defect description, a CWE and any related locations. Nullify passes that finding, the report and the related locations to its SAST autofix planner, editor and reviewer. The editor works on its own source copy. The reference fix and hidden grading tests stay outside the agents' workspace.
+
+### Recipe discovery
+
+A **recipe** records how to exercise this particular checkout. Each step has an ordered position, a phase, a command, a working directory, a timeout and an expected exit code. The recipe also records which capabilities the runner demonstrated, such as building the project, running its unit or integration tests, or starting a service.
+
+1. **Read the project.** On the original source, discovery identifies manifests and lockfiles, toolchain versions, package scripts and test files. The planner can inspect Makefiles and CI workflows and use the ecosystem's standard commands as a starting point. It proposes the project's own setup, build, lint, test and service-start steps where available.
+2. **Try the commands.** The runner executes the plan in the captured runtime and records exit codes, timeouts and output. If a command fails, the recipe repairer can use that evidence to revise the plan and retry. A separate reviewer checks whether model-proposed commands actually performed the work claimed for their phase. Setup file edits also get reviewed. Only edits classified as setup can travel with the recipe.
+3. **Replay from scratch.** The runner extracts a fresh copy of the original source, applies any approved setup edits and reruns the retained steps without asking the model to plan again. It compares the results with discovery, including the expected exit codes. Only a successful clean replay produces a frozen recipe. The artifact ties its steps and capabilities to the original source hash and the task. A build can be supported even when integration tests are unavailable.
+
+### What happens inside the sandbox
+
+For a single project, the runner uses its captured, pinned Docker image and mounts the working source at the captured paths. For a multi-service application, it can recreate the services together in a private Docker Compose project with pinned images. The benchmark configuration permits dependency downloads through a per-task registry proxy. It disables web search and retrieval, and masks the hidden test directory.
+
+For each candidate, the harness creates a fresh working copy, applies the recipe's approved setup edits and runs the project formatter on changed paths when one is available. It copies verified formatter changes back to the editor's candidate. It replays the supported lint, build, unit-test and integration-test steps in order with their prerequisites. If the recipe proved that the application can start, the plan can include startup and readiness steps so the reviewer can exercise the running service.
+
+| What the runner observes | What Nullify does with it |
 | --- | --- |
-| Prepare the case | Started the task environment, allowed services to settle, and captured a working source copy plus the runtime inventory. The fixer received the user report and worked on that copy. The harness withheld reference fixes and hidden grading tests. |
-| Locate the issue | Nullify's SAST localization step selected the relevant source for its production autofix state machine. Claude Opus 5.5 handled localization, recipe discovery, patching, sandbox review and test writing. Claude Haiku 5.5 handled context compaction. |
-| Build and check a candidate | Experimental recipe discovery identified commands to build or exercise the project. The harness formatted candidate changes, replayed the recipe in a sandbox and returned review feedback to the fixer for another round when needed. Recipe commands could reach package registries through a controlled proxy. Search and retrieval were disabled. |
-| Check candidate regression tests | For eligible projects, the test writer checked a proposed test on the original and modified source before retaining it. Unsupported languages skipped this stage. A source tree exceeding 8,192 paths or 128 MiB used a fallback that skipped recipe discovery, sandbox validation and test generation. |
-| Deliver and grade | The harness applied the final patch to the task environment, repeated declared build steps and restarted the source service. Terminal-Bench ran the task's official tests. A submitted success required both an accepted delivery and a true official `is_resolved` verdict. Sandbox checks informed the repair loop. The official grader supplied the benchmark verdict. |
+| A supported test command exits successfully | It records a pass only when the output shows tests actually ran. An empty suite or an unsupported phase is marked `ci_fallback`. This run gives that phase no credit. |
+| A command fails with a nonzero exit already seen during discovery | When time permits and the suite is applicable, the runner repeats the prerequisites and failing step in a second sandbox on untouched source. Matching exit codes and named failures can establish a pre-existing failure. A new named failure goes back to the editor. Inconclusive evidence defers the check. |
+| A command exposes a regression, or review finds the fix incomplete | The sandbox reviewer receives the intent of the fix, the candidate diff, changed paths and replay output. It can inspect the candidate in the same runner. A failed check or a review that finds a broken fix returns concrete feedback to the editor, which can revise and resubmit the patch. Rechecking the same diff can also produce another recorded round. |
+| Discovery cannot prove a recipe, a phase is unavailable, or the sandbox runs out of setup time | Repair can continue with less local evidence. Source preparation enforces limits of 8,192 paths and 128 MiB. When the original tree exceeds those limits the run skips discovery, sandbox validation and test generation. |
+
+On eligible projects, a test writer can propose a regression test. To retain it, the harness checks that the security assertion fails on the original and passes on the candidate, and that ordinary input passes on both. For the leaderboard, the harness delivers the final patch to the task environment, repeats the declared build steps and restarts the source service. Terminal-Bench then runs the hidden tests. A case scores only when delivery is accepted and the official grader reports `is_resolved: true`.
+
+### Sandbox coverage in this run
+
+Of 185 attempted cases, **84 produced a frozen recipe**. Those cases recorded **256 candidate validation rounds**. Of the other 101 attempts, 52 recorded an error preparing the original source for discovery, 45 recorded a discovery error, and four have no recorded discovery outcome. Five additional leaderboard cases had no usable environment.
+
+| Check | Distinct cases with a recorded pass in at least one round |
+| --- | ---: |
+| Build | 45 |
+| Lint | 15 |
+| Unit tests | 7 |
+| Integration tests | 2 |
+| Sandbox fix review | 53 |
+
+The [sandbox round records](sandbox-rounds.csv) cover all 190 leaderboard cases. Each numbered row is one validation call. Repeated patch hashes identify rechecks of the same candidate before formatting. Cases with no recorded round have one row with an empty round number. A blank check has no recorded outcome in that round. `ci_fallback` means the check was deferred, and `undetermined` means the reviewer reached no verdict. The independent leaderboard verdict and official test output are in the [case index](CASES.md).
+
+### Worked example from AIDE
+
+For CVE-2025-54389, discovery proved a four-step project recipe on the original source. It bootstrapped the toolchain, ran configure, built AIDE with make and ran the project's unit tests with `make check`. The clean replay reproduced all four expected zero exit codes. Lint and integration testing were deferred throughout candidate validation.
+
+| Sandbox round | Candidate SHA-256 prefix | Build | Unit tests | Fix review |
+| --- | --- | --- | --- | --- |
+| 1 | `7d3a0ac8360b` | Passed | Passed | Failed. The reviewer observed an unescaped control character in AIDE's diagnostic output. |
+| 2 | `96a6c7e13cca` | Passed | Passed | Passed on the revised patch. |
+| 3 and 4 | `96a6c7e13cca` | Passed | Passed | Passed again on the same patch. |
+
+The delivered patch escapes control characters in report and logging paths. Its full digest matches the candidate from rounds 2 through 4. The official grader then marked the case resolved. [Delivered patch](fixes/CVE-2025-54389.patch) · [Official test log and patch digest](test-logs/CVE-2025-54389.txt)
 
 ## Evaluation settings and coverage
 
